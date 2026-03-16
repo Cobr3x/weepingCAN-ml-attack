@@ -6,16 +6,14 @@ from rich.panel import Panel
 from rich.layout import Layout
 from rich.text import Text
 from rich.align import Align
-from rich.console import Group
 
 # Project dependencies
 from can_controller import CANBusMaster
-from node import BaseECU, NodeState, WeepingAttacker
+from node import BaseECU, NodeState
 
 # --- CLI UI with Rich ---
 class UIScreen:
-    def __init__(self, master: CANBusMaster, attacker: WeepingAttacker,):
-        self.attacker = attacker
+    def __init__(self, master: CANBusMaster):
         self.master = master
         self.running = True
 
@@ -65,15 +63,8 @@ class UIScreen:
         table.add_column("State")
         table.add_column("Next TX")
 
-        table2 = Table(expand=True)
-        table2.add_column("Attcker")
-        table2.add_column("Last Message")
-        table2.add_column(self.master.ui_state.get("current_bit", ""))
-        table2.add_row(self.master.ui_state.get("current_bit", ""))
-
-
         for ecu in self.master.ecus.values():
-            if isinstance(ecu, BaseECU) or isinstance(ecu, WeepingAttacker):
+            if isinstance(ecu, BaseECU):
                 state_style = "green"
                 if ecu.state is NodeState.ERROR_PASSIVE:
                     state_style = "yellow"
@@ -89,20 +80,7 @@ class UIScreen:
                     f"{ecu.get_time_until_tx():.2f}s"
                 )
 
-        table2 = Table(expand=True)
-        table2.add_column("Attacker")
-        table2.add_column("State")
-        table2.add_column("Sniffed Frame")
-
-        table2.add_row(
-            "WeepingCAN ECU",
-            self.attacker.ui_state_attacker.get("state", ""),
-            self.attacker.ui_state_attacker.get("last_frame", ""),
-        )
-
-        content = Group(table, table2)
-
-        return Panel(content, title="ECU Runtime State", border_style="green")
+        return Panel(table, title="ECU Runtime State", border_style="green")
 
     def _compose(self):
         layout = Layout()
@@ -119,4 +97,3 @@ class UIScreen:
             while self.running:
                 live.update(self._compose())
                 #time.sleep(0.01)
-                

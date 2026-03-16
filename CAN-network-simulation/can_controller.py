@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 import can
 
 # Project dependencies
-from ids import SimpleCANIDS
+#from ids import SimpleCANIDS
 
 # --- Bit Value ---
 class BitValue(Enum):
@@ -183,20 +183,20 @@ class CANBitStream:
                     run_len = 1
 
         return out_bits, out_fields
-    
-    @staticmethod
-    def bytes_to_bits(data: bytes) -> List[int]:
-        bits = []
-        for byte in data:
-            for i in range(7, -1, -1):
-                bits.append((byte >> i) & 1)
-        return bits
 
     def _build(self):
         raw_bits, raw_fields = self._build_unstuffed_payload_bits()
         stuffed_bits, stuffed_fields = self._apply_bit_stuffing(raw_bits, raw_fields)
         self.bits = stuffed_bits
         self.fields = stuffed_fields
+
+
+def bytes_to_bits(data: bytes) -> List[int]:
+    bits = []
+    for byte in data:
+        for i in range(7, -1, -1):
+            bits.append((byte >> i) & 1)
+    return bits
 
 
 # --- CAN Bus Master ---
@@ -248,7 +248,6 @@ class CANBusMaster:
     def submit_transmission(self, ecu, data: bytes, arb_id: int, r0: BitValue = BitValue.RECESSIVE):
         # Retransmission mechanism avoidance: discard policy
         with self.lock:
-            #if not any(ecu.id == ecus.id for ecus in self.pending):
             if ecu not in (ecuname for ecuname, _, _, _ in self.pending):
                 self.pending.append((ecu, data, arb_id, r0))
 
@@ -382,16 +381,6 @@ class CANBusMaster:
             "id": arb_id,
             "data": data.hex().upper(),
         }
-
-        # Transmitted frame notification 
-        for ecu in self.ecus.values():
-            notify = getattr(ecu, "notify_frame", None)
-            if callable(notify):
-                try:
-                    notify(arb_id, data)
-                except Exception as e:
-                    continue
-
 
         if self.use_vcan and self.vcan_bus is not None:
             try:
