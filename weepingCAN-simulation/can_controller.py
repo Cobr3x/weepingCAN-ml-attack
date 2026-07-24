@@ -10,7 +10,8 @@ from typing import List, Optional, Tuple
 import can
 
 # Project dependencies
-from ids import SimpleCANIDS
+from ids import CANIDS
+from ids import IDSLogger
 
 # --- Bit Value ---
 class BitValue(Enum):
@@ -205,9 +206,9 @@ class CANBusMaster:
     Simplified simulator:
     - arbitrates frames between multiple ECUs
     - handles collisions and error flags
-    - exposes state for CLI UI
+    - exposes state for GUI
     """
-    def __init__(self, use_vcan: bool = False, enable_ids: bool = False, collect_window: float = 0.002):
+    def __init__(self, use_vcan: bool = False, enable_ids: bool = False, enable_observer: bool = False, collect_window: float = 0.002):
         self.ecus = {}
         self.pending = []
         self.lock = threading.Lock()
@@ -216,7 +217,13 @@ class CANBusMaster:
         self.collect_window = collect_window 
         self.use_vcan = use_vcan
         self.enable_ids = enable_ids
+        self.enable_observer = enable_observer
         self.vcan_bus = None
+        self.logger = None
+        self.ids_stop_on_alert = False
+        self.attacked_id = None
+        self.aTEC = 0
+
         if self.use_vcan:
             try:
                 self.vcan_bus = can.interface.Bus(channel='vcan0', interface='socketcan')
@@ -224,10 +231,19 @@ class CANBusMaster:
                 self.vcan_bus = None
 
         if self.enable_ids:
-            self.ids = SimpleCANIDS(window_s=180.0, min_collisions=2, mode_share_th=0.6, entropy_th=0.75, cooldown_s=0.0)
+            if self.enable_observer:
+                self.ids = CANIDS(window_s=180.0, observer_mode=True, min_collisions=2, mode_share_th=0.6, entropy_th=0.75, cooldown_s=0.0)
+                #self.logger = IDSLogger(self.ids, self, "log.csv", period=0.5)
+                #self.logger.start()
+            else:
+                self.ids = CANIDS(window_s=180.0, min_collisions=2, mode_share_th=0.6, entropy_th=0.75, cooldown_s=0.0)
+
 
         # Uncomment to stop the simulation when a collision is detected
         # self.ids_stop_on_alert = True
+
+        # Bus throughput
+        self._baud_delay = 0.02
 
         # UI shared state
         self.ui_state = {
@@ -236,19 +252,21 @@ class CANBusMaster:
             "current_bit": "0",
             "collision_line": "",
             "last_frame": None,
-            "ids_alert": "",
+            "ids_alert": "Disable",
         }
 
-        if not self.enable_ids:
-            self.ui_state["ids_alert"] = "Disable"
+        if self.enable_ids:
+            self.ui_state["ids_alert"] = "No Alert"
 
     def register_ecu(self, ecu):
         self.ecus[ecu.slave_id] = ecu
+    
+    def notify_TEC(self, tec: int):
+        self.aTEC = tec
 
     def submit_transmission(self, ecu, data: bytes, arb_id: int, r0: BitValue = BitValue.RECESSIVE):
         # Retransmission mechanism avoidance: discard policy
         with self.lock:
-            #if not any(ecu.id == ecus.id for ecus in self.pending):
             if ecu not in (ecuname for ecuname, _, _, _ in self.pending):
                 self.pending.append((ecu, data, arb_id, r0))
 
@@ -258,6 +276,8 @@ class CANBusMaster:
 
     def stop(self):
         self._stop = True
+        #self.logger.stop()
+        #self.logger.join()
         try:
             if self.vcan_bus is not None:
                 self.vcan_bus.shutdown()
@@ -304,7 +324,7 @@ class CANBusMaster:
         bus_bitstream = ""
 
         while len(active) > 1:
-            time.sleep(0.02)
+            time.sleep(self._baud_delay)
             if bit_idx >= min(len(bitstreams[i][1].bits) for i in active):
                 break
 
@@ -351,7 +371,7 @@ class CANBusMaster:
                 
 
         if len(active) == 1:
-            time.sleep(0.02)
+            time.sleep(self._baud_delay)
             winner_idx = active[0]
             ecu, bs, _, _, _ = bitstreams[winner_idx]
 
@@ -362,7 +382,7 @@ class CANBusMaster:
                 bit_idx += 1
                 if field == Field.RTR:
                     bus_bitstream = ""
-                    time.sleep(0.02)
+                    time.sleep(self._baud_delay)
                 bus_bitstream += str(int(bus_bit))
                 contenders_str = f"{ecu.name}={int(bus_bit)}"
                 self.ui_state["arbitration_line"] = f"{contenders_str}"
@@ -376,6 +396,14 @@ class CANBusMaster:
         return None, None, None, None
     
     def _transmit_frame(self, winner_ecu, data, arb_id, r0):
+
+        # HACK: uncomment to have an attack looped simulation #
+        #if self.enable_ids and self.enable_observer:
+        #    ids_state = self.ids.check_alert(arb_id)
+        #    if ids_state["vID"] is None and not ids_state["observer"]:
+        #        self.ui_state["ids_alert"] = "No Alert"
+        #        self.attacked_id = None
+        ##
 
         self.ui_state["last_frame"] = {
             "ecu": winner_ecu.name,
@@ -391,6 +419,9 @@ class CANBusMaster:
                     notify(arb_id, data)
                 except Exception as e:
                     continue
+        
+        if self.enable_observer:
+            self.ids.notify_observer(arb_id)
 
 
         if self.use_vcan and self.vcan_bus is not None:
@@ -423,7 +454,7 @@ class CANBusMaster:
         bus_bitstream = ""
 
         while len(active) > 0 and not error_detected:
-            time.sleep(0.02)
+            time.sleep(self._baud_delay)
             offered = []
             for i in active:
                 ecu, bs, _, _, _ = bitstreams[i]
@@ -453,6 +484,7 @@ class CANBusMaster:
                         any_idx = offered[0][0]
                         arb_id = bitstreams[any_idx][2]
 
+                        # this attacker version has only the payload as a target
                         if hasattr(self, "ids") and self.ids is not None:
                             if field == Field.DATA:
                                 bs = bitstreams[any_idx][1]
@@ -460,26 +492,47 @@ class CANBusMaster:
                                 for j in range(bit_idx):
                                     if bs.fields[j] == Field.DATA:
                                         data_pos += 1
-                                self.ids.observe_collision(arb_id=arb_id, bit_idx=data_pos, offender_name=ecu.name)
+                                if offender_ecu.state is NodeState.ERROR_ACTIVE:
+                                    self.ids.observe_collision(arb_id=arb_id, bit_idx=data_pos, offender_name=ecu.name)
+                                else:
+                                    self.ids.observe_collision(arb_id=arb_id, bit_idx=data_pos, offender_name=ecu.name, error_passive=True)
 
                             alert = self.ids.check_alert(arb_id)
-                            if alert:
-                                self.ui_state["ids_alert"] = (
-                                    f"IDS ALERT ID=0x{alert['arb_id']:03X} "
-                                    f"coll={alert['collisions']} H={alert['entropy']:.2f} "
-                                    f"top={alert['top_offender']} ({alert['top_offender_share']*100:.1f}%)"
-                                )
-                                if self.ids_stop_on_alert:
+                            if not self.enable_observer:
+                                if alert['alert']:
                                     self.ui_state["ids_alert"] = (
-                                        f"IDS ALERT ID=0x{alert['arb_id']:03X} - SIMULATION STOPPED - "
+                                        f"IDS ALERT ID=0x{alert['arb_id']:03X} - "
                                         f"coll={alert['collisions']} H={alert['entropy']:.2f} "
                                         f"top={alert['top_offender']} ({alert['top_offender_share']*100:.1f}%)"
                                     )
+                                    if self.ids_stop_on_alert:
+                                        self.ui_state["ids_alert"] = (
+                                            f"IDS ALERT ID=0x{alert['arb_id']:03X} - SIMULATION STOPPED - "
+                                            f"coll={alert['collisions']} H={alert['entropy']:.2f} "
+                                            f"top={alert['top_offender']} ({alert['top_offender_share']*100:.1f}%)"
+                                        )
 
-                                    time.sleep(0.2)
-                                    sys.stdout.flush()
-                                    sys.stderr.flush()
-                                    os._exit(0)
+                                        time.sleep(0.2)
+                                        sys.stdout.flush()
+                                        sys.stderr.flush()
+                                        os._exit(0)
+                            else:
+                                if alert["vID"] is not None and not alert["observer"]:
+                                    self.ui_state["ids_alert"] = (
+                                        f"IDS ALERT ID=0x{alert['vID']:03X} - "
+                                        f"Phase={alert["phase"]} aTEC={alert["aTEC"]} vTEC={alert["vTEC"]} aID={alert["aID"]}"
+                                    )
+
+                                else:
+                                    if alert["observer"]:
+                                        self.ui_state["ids_alert"] = (
+                                            f"IDS ALERT ID=0x{alert['vID']:03X} - STOPPED VICTIM TRANSMISSION - "
+                                            f"Phase={alert["phase"]} aTEC={alert["aTEC"]} vTEC={alert["vTEC"]} aID={alert["aID"]}"
+                                        )
+                                        self.attacked_id = alert["vID"]
+                                    else:
+                                        self.ui_state["ids_alert"] = "No Alert"
+                                        self.attacked_id = None
 
                         offered_at_error = offered[:]
                         bus_bit_at_error = bus_bit
@@ -536,7 +589,7 @@ class CANBusMaster:
         self.ui_state["collision_line"] = f"SENDED ERROR FLAG ACTIVE by {offender_ecu.name}"
         self.ui_state["arbitration_line"] = "ACTIVE ERROR FLAGE"
         for biterror_counter in range(14):
-            time.sleep(0.02)
+            time.sleep(self._baud_delay)
             if biterror_counter < 6:
                 bus_bitstream += "0"
                 bus_bit = BitValue.DOMINANT
@@ -563,7 +616,7 @@ class CANBusMaster:
         self.ui_state["arbitration_line"] = "PASSIVE ERROR FLAGE"
         self.ui_state["current_bit"] = f"CURRENT BIT={int(BitValue.RECESSIVE)}"
         for i in range(6):
-            time.sleep(0.02)
+            time.sleep(self._baud_delay)
             bus_bitstream += "1"
             self.ui_state["bus_signal"] = f"{bus_bitstream} "
 

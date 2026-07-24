@@ -1,0 +1,4 @@
+python-can
+rich
+numpy
+scikit-learn

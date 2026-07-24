@@ -117,7 +117,10 @@ class BaseECU:
 
             if dt <= 0:
                 data = self._build_payload()
-                self.master.submit_transmission(self, data, self.arb_id, r0=BitValue.RECESSIVE)
+                if self.arb_id != self.master.attacked_id:
+                    self.master.submit_transmission(self, data, self.arb_id, r0=BitValue.DOMINANT)
+                else:
+                    self.master.submit_transmission(self, data, 0, r0=BitValue.DOMINANT)
 
                 self.next_tx_time += self.tx_period
                 while self.next_tx_time <= now:
@@ -209,7 +212,6 @@ class WeepingAttacker:
         frame_bits = CANBitStream.bytes_to_bits(frame_data)
 
         if self.attack_state == "sniffing_1":
-            self._log(f"almeno ci entro", False)
             self.sniffed_data_1[arbitration_id].append({
                 'data': frame_data,
                 'bits': frame_bits,
@@ -261,6 +263,7 @@ class WeepingAttacker:
             return 999
         else:
             return float(self.avg_interval)
+            #return max(0.0, self.next_attack_time - time.time())
 
     @property
     def arb_id(self):
@@ -550,7 +553,6 @@ class WeepingAttacker:
         Reduces the TEC by sending 'harmless' frames with a low ID (high priority).
 
         Requirements:
-        - The ID must change for every frame (not always the same), while still keeping high priority (low ID).
         - 1 to 3 frames per round (if num_messages is not specified).
         - Payload must be completely random (8 independent bytes for each transmission).
         """
@@ -571,23 +573,11 @@ class WeepingAttacker:
         else:
             upper = 0x1FF
 
-        # ID change for each send.
-        if getattr(self, "_reset_id_cursor", None) is None:
-            base = int(self.victim_id) - random.randint(1, 5) if self.victim_id is not None else 0x100
-            self._reset_id_cursor = max(0x010, min(base, upper))
-
         def pick_next_id() -> int:
-            # Pseudo-random step (1..5) and not-observed ID finding (best effort).
-            for _ in range(64):
-                step = random.randint(1, 5)
-                cand = self._reset_id_cursor + step
-                if cand > upper:
-                    span = max(1, (upper - 0x010 + 1))
-                    cand = 0x010 + ((cand - 0x010) % span)
-                self._reset_id_cursor = cand
-                if cand not in observed:
-                    return cand
-            return int(self._reset_id_cursor)
+            if random.randint(0,1):
+                return 10
+            else:
+                return 20
 
         # Limited bursting and doesn't steal the victim sending window
         if self.victim_ecu is not None:
@@ -807,6 +797,7 @@ class WeepingAttacker:
         attack_count = 0
 
         while self.running and not self.is_bus_off():
+            self.master.notify_TEC(self.tec)
             if self.victim_ecu is not None and self.victim_ecu.is_bus_off():
                 return
 

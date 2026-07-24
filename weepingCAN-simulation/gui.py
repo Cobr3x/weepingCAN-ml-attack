@@ -11,8 +11,9 @@ from rich.console import Group
 # Project dependencies
 from can_controller import CANBusMaster
 from node import BaseECU, NodeState, WeepingAttacker
+from ids import CANIDS
 
-# --- CLI UI with Rich ---
+# CLI UI with Rich
 class UIScreen:
     def __init__(self, master: CANBusMaster, attacker: WeepingAttacker,):
         self.attacker = attacker
@@ -118,5 +119,5 @@ class UIScreen:
         with Live(self._compose(), refresh_per_second=10, screen=True) as live:
             while self.running:
                 live.update(self._compose())
-                #time.sleep(0.01)
+                time.sleep(0.001)
                 

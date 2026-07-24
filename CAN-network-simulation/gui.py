@@ -11,7 +11,7 @@ from rich.align import Align
 from can_controller import CANBusMaster
 from node import BaseECU, NodeState
 
-# --- CLI UI with Rich ---
+# CLI UI with Rich
 class UIScreen:
     def __init__(self, master: CANBusMaster):
         self.master = master
@@ -19,8 +19,8 @@ class UIScreen:
 
     def _render_top(self):
         txt = Text()
-        txt.append("WEEPING CAN ATTACK SIMULATOR\n", style="bold cyan")
-        txt.append("Bit-level arbitration, error handling, IDS & ECU state monitoring.\n", style="italic")
+        txt.append("CAN BUS SIMULATOR\n", style="bold cyan")
+        txt.append("Bit-level arbitration, error handling.\n", style="italic")
         return Panel(txt, title="Simulator", border_style="cyan")
 
     def _render_middle(self):

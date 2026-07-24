@@ -35,9 +35,9 @@ def main():
         ui.running = False
         master.stop()
         ecu1.stop()
-        #ecu2.stop()
-        #ecu3.stop()
-        #ecu4.stop()
+        ecu2.stop()
+        ecu3.stop()
+        ecu4.stop()
 
 
 if __name__ == "__main__":
