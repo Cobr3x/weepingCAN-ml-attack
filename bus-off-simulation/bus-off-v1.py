@@ -1,0 +1,1247 @@
+"""can_sim_dynamic.py
+
+Dynamic CAN simulator with an independent transmission timer for each ECU.
+ECUs with a lower identifier (higher priority) wait longer between transmissions.
+ECUs with a higher identifier (lower priority) wait less between transmissions.
+
+IMPLEMENTED CORRECTIONS:
+1. START_SLOT removed: every PENDING ECU participates in arbitration immediately.
+2. ACTIVE ERROR FLAG: 6 DOMINANT bits (0) while TEC < 128.
+3. PASSIVE ERROR FLAG: 8 RECESSIVE bits (1) while TEC >= 128.
+4. TEC is decremented by 1 after a successful transmission.
+5. On a collision, both ECUs increment TEC by 8.
+"""
+
+# Enable postponed annotation evaluation so forward references do not require runtime ordering.
+from __future__ import annotations
+
+# Standard-library modules used for timing, concurrency, queues, randomness, and data containers.
+import time
+import threading
+import queue
+import random
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Deque, Dict, List, Optional, Tuple
+
+# python-can is optional: the pure-Python simulator continues to work when the package is unavailable.
+try:
+    import can  # python-can
+    CAN_AVAILABLE = True
+except Exception:
+    CAN_AVAILABLE = False
+# Low-level SocketCAN support uses operating-system sockets and native CAN frame packing.
+import os
+import socket
+import struct
+
+# Linux SocketCAN flag and protocol-error mask used to construct diagnostic error frames.
+CAN_ERR_FLAG = 0x20000000
+CAN_ERR_PROT = 0x00000008  # Error class "protocol violation", used here for bit-monitoring diagnostics.
+
+# Open and bind a raw CAN socket to the requested Linux CAN or virtual-CAN interface.
+def sockcan_open(iface: str):
+    s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    s.bind((iface,))
+    return s
+
+# Send a normal diagnostic frame that identifies an ECU as having emitted an active error indication.
+def sockcan_send_error_active_diag(sock, ecu_name: str):
+    arb_id = 0x7FF  # Reserved diagnostic ID; choose an identifier not used by simulated data frames.
+    payload = bytes([ord(ecu_name[0]), ord('E'), ord('A'), 0, 0, 0, 0, 0])
+    sockcan_send_data(sock, arb_id, payload)
+
+# Serialize up to eight data bytes into the native SocketCAN can_frame layout and transmit it.
+def sockcan_send_data(sock, arb_id: int, data: bytes):
+    dlc = min(len(data), 8)
+    frame = struct.pack("=IB3x8s", arb_id & 0x1FFFFFFF, dlc, data[:8].ljust(8, b"\x00"))
+    sock.send(frame)
+
+# Send a SocketCAN protocol error frame containing compact diagnostic information.
+def sockcan_send_error_active(sock, ecu_name: str, offender_code: int = 1):
+    # Build a SocketCAN error frame by combining CAN_ERR_FLAG with the protocol-error class.
+    can_id = CAN_ERR_FLAG | CAN_ERR_PROT
+    # The payload is diagnostic metadata displayed by candump: ECU initial, "E", "A", and offender code.
+    payload = bytes([ord(ecu_name[0]) & 0xFF, ord('E'), ord('A'), offender_code & 0xFF]).ljust(8, b"\x00")
+    frame = struct.pack("=IB3x8s", can_id, 8, payload)
+    sock.send(frame)
+
+
+# Represent the two physical CAN bus levels; dominant zero overrides recessive one on the wired-AND bus.
+class BitValue(Enum):
+    DOMINANT = 0
+    RECESSIVE = 1
+
+    @staticmethod
+    # Convert a numeric bit into the corresponding strongly typed bus value.
+    def from_int(v: int) -> "BitValue":
+        return BitValue.DOMINANT if v == 0 else BitValue.RECESSIVE
+
+    # Convert the enum back to the integer representation used by CRC and logging code.
+    def __int__(self) -> int:
+        return 0 if self is BitValue.DOMINANT else 1
+
+
+# Track CAN fault-confinement states derived from each ECU transmission error counter.
+class NodeState(Enum):
+    ERROR_ACTIVE = auto()
+    ERROR_PASSIVE = auto()
+    BUS_OFF = auto()
+
+
+# Enumerate the master state-machine phases used to coordinate bus activity.
+class MasterState(Enum):
+    IDLE = auto()
+    ARBITRATION = auto()
+    TRANSMIT = auto()
+    ERROR_FLAG = auto()
+    ERROR_DELIM = auto()
+    EOF = auto()
+    INTERFRAME = auto()
+
+
+# Label every emitted bit with its logical CAN frame field for arbitration, diagnostics, and fault injection.
+class Field(Enum):
+    SOF = auto()
+    ID = auto()
+    RTR = auto()
+    IDE = auto()
+    R0 = auto()
+    DLC = auto()
+    DATA = auto()
+    CRC = auto()
+    CRC_DELIM = auto()
+    ACK_SLOT = auto()
+    ACK_DELIM = auto()
+    EOF = auto()
+    INTERMISSION = auto()
+    STUFF = auto()
+
+
+# Immutable-style request metadata passed from an ECU to the master arbitration queue.
+@dataclass
+class TransmissionRequest:
+    slave_name: str
+    slave_id: int
+    arbitration_id: int
+    data: bytes
+    timestamp: float
+
+
+# Broadcast record delivered to each ECU receive queue for simulated bit monitoring.
+@dataclass
+class BitTransmission:
+    bit_value: BitValue
+    timestamp: float
+    sender_name: str
+    field: Field
+
+
+# Calculate the 15-bit CAN cyclic redundancy check using polynomial 0x4599.
+def _crc15_can(bits: List[int]) -> int:
+    """Compute CRC-15/CAN over a bit stream."""
+    poly = 0x4599
+    crc = 0
+    for b in bits:
+        msb = (crc >> 14) & 1
+        crc = ((crc << 1) & 0x7FFF) | (b & 1)
+        if msb:
+            crc ^= poly
+    return crc & 0x7FFF
+
+
+# Construct the complete base-frame bit sequence and retain a parallel field label for each bit.
+class CANBitStream:
+    """Build a *stuffed* CAN base frame bit stream and per-bit field labels."""
+
+    # Normalize the arbitration ID and payload before building the frame once during initialization.
+    def __init__(self, arbitration_id: int, data: bytes, r0: BitValue = BitValue.RECESSIVE):
+        self.arb_id = arbitration_id & 0x7FF
+        self.data = data[:8]
+        self.r0 = r0
+
+        self.bits: List[BitValue] = []
+        self.fields: List[Field] = []
+        self._build()
+
+    # Append one bit and its field label while keeping both parallel arrays synchronized.
+    def _push(self, bit: BitValue, field: Field):
+        self.bits.append(bit)
+        self.fields.append(field)
+
+    # Assemble the logical frame before inserting CAN bit-stuffing bits.
+    def _build_unstuffed_payload_bits(self) -> Tuple[List[BitValue], List[Field]]:
+        bits: List[BitValue] = []
+        fields: List[Field] = []
+
+        # Local helper used to append matching entries to the temporary bit and field lists.
+        def push(bit: BitValue, field: Field):
+            bits.append(bit)
+            fields.append(field)
+
+        # SOF
+        push(BitValue.DOMINANT, Field.SOF)
+
+        # 11-bit ID (MSB first)
+        for i in range(10, -1, -1):
+            push(BitValue.from_int((self.arb_id >> i) & 1), Field.ID)
+
+        # Control field (base frame)
+        push(BitValue.DOMINANT, Field.RTR)
+        push(BitValue.DOMINANT, Field.IDE)
+        push(self.r0, Field.R0)
+
+        # DLC 4 bits
+        dlc = len(self.data)
+        for i in range(3, -1, -1):
+            push(BitValue.from_int((dlc >> i) & 1), Field.DLC)
+
+        # DATA bytes
+        for byte in self.data:
+            for i in range(7, -1, -1):
+                push(BitValue.from_int((byte >> i) & 1), Field.DATA)
+
+        # CRC
+        crc_input = [int(b) for b in bits]
+        crc = _crc15_can(crc_input)
+        for i in range(14, -1, -1):
+            push(BitValue.from_int((crc >> i) & 1), Field.CRC)
+
+        # CRC delimiter
+        push(BitValue.RECESSIVE, Field.CRC_DELIM)
+        # ACK slot
+        push(BitValue.RECESSIVE, Field.ACK_SLOT)
+        push(BitValue.RECESSIVE, Field.ACK_DELIM)
+        # EOF 7 recessive
+        for _ in range(7):
+            push(BitValue.RECESSIVE, Field.EOF)
+        # Intermission 3 recessive
+        for _ in range(3):
+            push(BitValue.RECESSIVE, Field.INTERMISSION)
+
+        return bits, fields
+
+    @staticmethod
+    # Insert the opposite bit after five identical consecutive bits in the stuffable frame region.
+    def _apply_bit_stuffing(bits: List[BitValue], fields: List[Field]) -> Tuple[List[BitValue], List[Field]]:
+        """Stuff from SOF through end of CRC sequence (inclusive)."""
+        out_bits: List[BitValue] = []
+        out_fields: List[Field] = []
+
+        run_val: Optional[BitValue] = None
+        run_len = 0
+
+        # Bit stuffing applies only from SOF through the CRC sequence, not to delimiters or EOF.
+        def should_stuff(idx: int) -> bool:
+            return fields[idx] in {
+                Field.SOF, Field.ID, Field.RTR, Field.IDE, Field.R0, Field.DLC, Field.DATA, Field.CRC
+            }
+
+        # Scan the original sequence once while tracking the current run of equal bus values.
+        for i, (b, f) in enumerate(zip(bits, fields)):
+            out_bits.append(b)
+            out_fields.append(f)
+
+            if not should_stuff(i):
+                run_val = None
+                run_len = 0
+                continue
+
+            if run_val is None or b != run_val:
+                run_val = b
+                run_len = 1
+            else:
+                run_len += 1
+
+            # A five-bit run is broken by inserting the complementary bus value as a STUFF field.
+            if run_len == 5:
+                stuffed = BitValue.DOMINANT if b is BitValue.RECESSIVE else BitValue.RECESSIVE
+                out_bits.append(stuffed)
+                out_fields.append(Field.STUFF)
+                run_val = None
+                run_len = 0
+
+        return out_bits, out_fields
+
+    # Build the raw frame first, then replace the public arrays with their stuffed counterparts.
+    def _build(self):
+        raw_bits, raw_fields = self._build_unstuffed_payload_bits()
+        stuffed_bits, stuffed_fields = self._apply_bit_stuffing(raw_bits, raw_fields)
+        self.bits = stuffed_bits
+        self.fields = stuffed_fields
+
+
+# Provide deterministic, repeatable bus-bit overrides for protocol-error test scenarios.
+class FaultInjector:
+    """Optional: inject deterministic faults for testing."""
+
+    # A value of zero disables R0 fault injection; positive values inject once every N frames.
+    def __init__(self, *, flip_r0_every_n_frames: int = 0):
+        self.flip_r0_every_n_frames = flip_r0_every_n_frames
+        self._frame_count = 0
+
+    # Advance the frame counter whenever the master begins a new arbitration cycle.
+    def on_new_frame(self):
+        self._frame_count += 1
+
+    # Optionally force R0 dominant on selected frames while leaving all other bits untouched.
+    def override_bus_bit(self, field: Field, current_bus: BitValue) -> BitValue:
+        if self.flip_r0_every_n_frames and field == Field.R0:
+            if (self._frame_count % self.flip_r0_every_n_frames) == 0:
+                return BitValue.DOMINANT
+        return current_bus
+
+
+# Model one CAN ECU, including periodic requests, fault counters, state, and per-bit transmission progress.
+class BaseECU:
+    # Initialize ECU identity, scheduling, worker threads, frame state, and error-flag state.
+    def __init__(
+        self,
+        name: str,
+        slave_id: int,
+        arb_id: int,
+        master: "CANMaster",
+        tx_period: float = 2.0,
+        start_delay: float = 0.0,
+        auto_tx: bool = True,
+    ):
+        self.name = name
+        self.slave_id = slave_id
+        self.arb_id = arb_id & 0x7FF
+        self.master = master
+
+        # Periodic scheduling is based on wall-clock time and an independently configurable initial delay.
+        self.tx_period = tx_period
+        self.start_delay = start_delay
+        self.next_tx_time = 0.0
+
+        # TEC and REC implement the CAN fault-confinement counters used to derive the node state.
+        self.tec = 0
+        self.rec = 0
+        self.state = NodeState.ERROR_ACTIVE
+
+        # Separate daemon threads generate outgoing requests and consume the simulated bus broadcast.
+        self._stop = False
+        self.auto_tx = bool(auto_tx)
+        self._tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
+        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+
+        # Transmission state
+        self._pending_req: Optional[TransmissionRequest] = None
+        self._bitstream: Optional[CANBitStream] = None
+        self._cursor = 0
+        self._currently_transmitting = False
+
+        self._silence_bit_errors = False  # used to ignore repeated bit-errors in ERROR_PASSIVE
+
+        # Per-ECU error-flag emission (to model ACTIVE vs PASSIVE behaviour correctly)
+        #   - ERR_ACTIVE: drives the bus dominant (0) and will force an error-frame
+        #   - ERR_PASSIVE: drives recessive (1) and does NOT affect the bus if another sender drives dominant
+        self._tx_mode: str = "NORMAL"  # NORMAL | ERR_ACTIVE | ERR_PASSIVE
+        self._err_flag_bits_left: int = 0
+        self.master.register_slave(self)
+
+        
+
+    # Start receive processing immediately and periodic transmission only when auto_tx is enabled.
+    def start(self):
+        print(f"[{self.name}] START slave_id={self.slave_id} ID=0x{self.arb_id:03X} period={self.tx_period:.2f}s")
+        self.next_tx_time = time.time() + self.start_delay
+        self._rx_thread.start()
+        if self.auto_tx:
+            self._tx_thread.start()
+
+    # Expose a deterministic one-shot API for tests that should not depend on the periodic scheduler.
+    def request_once(self, data: bytes, *, arbitration_id: Optional[int] = None):
+        """Queue exactly one transmission (used for deterministic tests)."""
+        if self.is_bus_off():
+            print(f"[{self.name}] request_once ignored (BUS_OFF)")
+            return
+        if self._pending_req is not None:
+            print(f"[{self.name}] request_once ignored (already pending)")
+            return
+        # Capture one timestamp for the complete request and clamp an optional arbitration ID to 11 bits.
+        now = time.time()
+        aid = self.arb_id if arbitration_id is None else (arbitration_id & 0x7FF)
+        self._pending_req = TransmissionRequest(
+            slave_name=self.name,
+            slave_id=self.slave_id,
+            arbitration_id=aid,
+            data=data[:8],
+            timestamp=now,
+        )
+        self._bitstream = None
+        self._cursor = 0
+        self.master.submit_request(self._pending_req)
+
+    # Signal both ECU worker loops to exit at their next stop-condition check.
+    def stop(self):
+        self._stop = True
+
+    # Recompute ERROR_ACTIVE, ERROR_PASSIVE, or BUS_OFF directly from the current TEC threshold.
+    def _update_state(self):
+        if self.tec >= 256:
+            self.state = NodeState.BUS_OFF
+        elif self.tec >= 128:
+            self.state = NodeState.ERROR_PASSIVE
+        else:
+            self.state = NodeState.ERROR_ACTIVE
+
+    # ---- Master-facing API ----
+
+    # BUS_OFF nodes are excluded from new requests, arbitration, reception updates, and retransmission.
+    def is_bus_off(self) -> bool:
+        return self.state is NodeState.BUS_OFF
+
+    # A frame is eligible only after both request metadata and its generated bitstream are available.
+    def has_pending_frame(self) -> bool:
+        return (self._pending_req is not None) and (self._bitstream is not None) and (not self.is_bus_off())
+
+    # Lazily build the bitstream so queued requests can be replaced or discarded before arbitration.
+    def begin_frame_if_needed(self):
+        """Ensure bitstream is ready for a pending request."""
+        if self._pending_req is None or self._bitstream is not None:
+            return
+        self._bitstream = CANBitStream(self._pending_req.arbitration_id, self._pending_req.data, r0=BitValue.RECESSIVE)
+        self._cursor = 0
+
+
+    # Convert a detected transmission error into a finite active or passive error-flag emission.
+    def _enter_error_flag(self, *, active: bool):
+        """Stop sending the frame and start emitting an error flag (ACTIVE=dominant, PASSIVE=recessive)."""
+        self._silence_bit_errors = True
+        self._tx_mode = "ERR_ACTIVE" if active else "ERR_PASSIVE"
+        self._err_flag_bits_left = 6  # in this simulator we use 6 bits as requested
+        # Consider the attempt concluded: do not keep the request pending (respects tx_period scheduling)
+        self._pending_req = None
+        self._bitstream = None
+        self._cursor = 0
+
+    # Allow the master to recognize when this ECU is currently forcing dominant error-flag bits.
+    def is_emitting_error_flag_active(self) -> bool:
+        return self._tx_mode == "ERR_ACTIVE"
+
+    # Return the next bus contribution without advancing any cursor or error-flag counter.
+    def peek_next_bit(self) -> Optional[Tuple[BitValue, Field]]:
+        # If we are emitting an error flag, output it ONLY for the configured number of bits.
+        # After that, this ECU stops contributing bits to the bus (as requested).
+        if self._tx_mode == "ERR_ACTIVE":
+            if self._err_flag_bits_left <= 0:
+                return None
+            return BitValue.DOMINANT, Field.DATA
+        if self._tx_mode == "ERR_PASSIVE":
+            if self._err_flag_bits_left <= 0:
+                return None
+            return BitValue.RECESSIVE, Field.DATA
+
+        # Normal transmission reads the current bit and field from the prebuilt stuffed frame.
+        if not self.has_pending_frame():
+            return None
+        assert self._bitstream is not None
+        if self._cursor >= len(self._bitstream.bits):
+            return None
+        return self._bitstream.bits[self._cursor], self._bitstream.fields[self._cursor]
+    # Consume one emitted error-flag bit or advance one position in the normal frame.
+    def advance(self):
+        # During error-flag emission, we do not advance the original frame.
+        if self._tx_mode in {"ERR_ACTIVE", "ERR_PASSIVE"}:
+            if self._err_flag_bits_left > 0:
+                self._err_flag_bits_left -= 1
+            return
+        self._cursor += 1
+
+    # Rewind transmission progress while preserving the pending request for a future arbitration attempt.
+    def reset_for_retransmission(self):
+        self._cursor = 0
+        self._currently_transmitting = False
+        self._tx_mode = "NORMAL"
+        self._err_flag_bits_left = 0
+
+    # Mark whether this ECU must compare its intended bit with the resolved bus value.
+    def mark_as_transmitting(self, value: bool):
+        self._currently_transmitting = value
+
+    # Detect a bit-monitoring error when a transmitter sends recessive but observes dominant outside arbitration.
+    def on_bus_bit(self, bus_bit: BitValue, field: Field, *, arbitration_window: bool):
+        """Bit monitoring for the *current transmitter*."""
+        if not self._currently_transmitting:
+            return
+        # Once an ECU has entered error-flag emission, it must not keep reporting bit errors.
+        if self._tx_mode in {"ERR_ACTIVE", "ERR_PASSIVE"}:
+            return
+        if self._silence_bit_errors:
+            return
+        nxt = self.peek_next_bit()
+        if nxt is None:
+            return
+        sent_bit, _sent_field = nxt
+        # Recessive-versus-dominant mismatch is expected during arbitration but is an error afterward.
+        if sent_bit is BitValue.RECESSIVE and bus_bit is BitValue.DOMINANT:
+            if arbitration_window:
+                return
+            self.master.report_bit_error(self.slave_id, offender="bit_monitoring")
+
+    # Apply bounded counter deltas and immediately refresh the node fault-confinement state.
+    def apply_error_update(self, *, tec_delta: int = 0, rec_delta: int = 0):
+        self.tec = max(0, self.tec + tec_delta)
+        self.rec = max(0, self.rec + rec_delta)
+        self._update_state()
+
+    # Successful transmission gradually recovers the transmitting ECU by reducing TEC.
+    def apply_success_update(self):
+        """Apply the successful-transmission rule by decrementing TEC by one."""
+        self.tec = max(0, self.tec - 1)
+        self._update_state()
+
+    # Clamp overdue schedules to zero so status output never reports a negative waiting time.
+    def get_time_until_tx(self) -> float:
+        """Return the remaining time, in seconds, before the next scheduled transmission."""
+        return max(0.0, self.next_tx_time - time.time())
+
+    # ---- Internal threads ----
+
+    # Periodically create payloads and submit requests without blocking the master state machine.
+    def _tx_loop(self):
+        if not self.auto_tx:
+            return
+        
+        # BUS_OFF ECUs remain alive as threads but are prevented from generating further traffic.
+        while not self._stop:
+            if self.is_bus_off():
+                time.sleep(0.2)
+                continue
+            
+            now = time.time()
+            if now >= self.next_tx_time:
+                # Create a new request only when this ECU does not already have one pending.
+                if self._pending_req is None:
+                    data = bytes([self.slave_id] * 8)  # Fill the payload with the slave ID for easy identification.
+                    self._pending_req = TransmissionRequest(
+                        slave_name=self.name,
+                        slave_id=self.slave_id,
+                        arbitration_id=self.arb_id,
+                        data=data,
+                        timestamp=now,
+                    )
+                    self._bitstream = None
+                    self._cursor = 0
+                    self.master.submit_request(self._pending_req)
+                    print(f"[{self.name}] WANT TRANSMIT (ID=0x{self.arb_id:03X}) TEC={self.tec} REC={self.rec} State={self.state.name}")
+                
+                # Schedule the next periodic transmission relative to the current time.
+                self.next_tx_time = now + self.tx_period
+            
+            time.sleep(0.05)
+
+    # Consume every broadcast bus bit; bit-monitoring itself is performed synchronously by the master.
+    def _rx_loop(self):
+        while not self._stop:
+            bt = self.master.get_bit_for_slave(self.slave_id, timeout=0.1)
+            if bt is None:
+                continue
+
+
+# Coordinate arbitration, bus resolution, error handling, broadcasts, and frame lifecycle transitions.
+class CANMaster:
+    # Initialize timing, queues, state-machine data, fault injection, and optional SocketCAN forwarding.
+    def __init__(
+        self,
+        tick_ms: float = 0.1,
+        forward_to_socketcan: bool = False,
+        can_channel: str = "vcan0",
+        fault_injector: Optional[FaultInjector] = None,
+        gather_window_s: float = 0.30,
+    ):
+        # Convert the public millisecond tick interval to seconds for time.sleep.
+        self.tick = tick_ms / 1000.0
+        self.state = MasterState.IDLE
+        self.clock = 0
+
+        # Each registered ECU owns a receive queue; new transmission intents share one master queue.
+        self.slaves: Dict[int, BaseECU] = {}
+        self.bit_queues: Dict[int, "queue.Queue[BitTransmission]"] = {}
+        self._pending_starts: "queue.Queue[TransmissionRequest]" = queue.Queue()
+
+        # The main worker advances the bus; the status worker periodically prints a human-readable snapshot.
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._status_thread = threading.Thread(target=self._status_loop, daemon=True)
+
+        # These collections describe the current arbitration and transmission participants.
+        # Bus activity
+        self._contenders: List[int] = []
+        self._active_senders: List[int] = []
+        self._winner: Optional[int] = None
+        self._current_field: Field = Field.INTERMISSION
+        self._arbitration_window = False
+        
+        # The gather window groups requests that arrive close together into one arbitration round.
+        # Arbitration gather window (to simulate the master "waiting a bit" to collect contenders)
+        self.gather_window_s = float(gather_window_s)
+        self._collecting = False
+        self._collect_deadline = 0.0
+        self._collect_contenders: set[int] = set()
+        
+        # Per-frame error data records senders, delimiters, and whether the frame remains valid.
+        # Error handling
+        self._error_senders: List[int] = []  # Every ECU required to emit an error flag for the current frame.
+        self._passive_error_senders: set[int] = set()  # ECUs that reported a passive bit error in this frame.
+        self._error_flag_bits_left = 0
+        self._error_delim_bits_left = 0
+        self._frame_ok = True
+
+        # Active error flags are handled inside TRANSMIT so their six dominant bits are visible on the bus.
+        # Per-frame ACTIVE error handling (modelled inside TRANSMIT, not as a global immediate abort)
+        self._active_error_frame = False
+        self._error_flag_ticks = 0  # counts emitted ACTIVE error-flag bits
+        self._rec_bumped_for_error = False
+
+        # Use the supplied deterministic injector or a disabled default injector.
+        self._fault = fault_injector or FaultInjector()
+
+        # SocketCAN output is best-effort: failure to open the interface does not stop the simulator.
+        # SocketCAN
+        self._can_iface = os.getenv("CAN_IFACE", "vcan0")  
+        try:
+            self._sockcan = sockcan_open(self._can_iface)
+            print(f"[MASTER] SocketCAN OK in {self._can_iface}")
+        except OSError as e:
+            print(f"[MASTER] SocketCAN DISABLED in {self._can_iface}: {e}")
+            self._sockcan = None
+
+        self._err_active_sent = False 
+
+    # Register or replace an ECU by slave ID and allocate its independent receive queue.
+    def register_slave(self, ecu: BaseECU):
+        self.slaves[ecu.slave_id] = ecu
+        self.bit_queues[ecu.slave_id] = queue.Queue()
+
+    # Queue a transmission intent for collection by the master state-machine thread.
+    def submit_request(self, req: TransmissionRequest):
+        self._pending_starts.put(req)
+
+    # Block briefly for the next broadcast bit addressed to one ECU receive queue.
+    def get_bit_for_slave(self, slave_id: int, timeout: float = 0.01) -> Optional[BitTransmission]:
+        q = self.bit_queues.get(slave_id)
+        if q is None:
+            return None
+        try:
+            return q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # Launch the master bus loop and the independent periodic status reporter.
+    def start(self):
+        print("[MASTER] START")
+        self._thread.start()
+        self._status_thread.start()
+
+    # Request shutdown and wait briefly for the main master thread to terminate.
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=2)
+        print("[MASTER] STOP")
+
+    # Report state only while the bus is idle to avoid interleaving large status blocks with bit traces.
+    def _status_loop(self):
+        """Print a periodic snapshot of the simulated bus and every ECU state."""
+        while not self._stop:
+            time.sleep(3.0)  # Refresh the status display every three seconds.
+            
+            if self.state == MasterState.IDLE:
+                print(f"\n{'='*100}")
+                print(f"STATUS BUS (IDLE)")
+                print(f"{'='*100}")
+                
+                for sid in sorted(self.slaves.keys()):
+                    ecu = self.slaves[sid]
+                    time_left = ecu.get_time_until_tx()
+                    
+                    if ecu.is_bus_off():
+                        status = "BUS-OFF"
+                    elif ecu._pending_req is not None:
+                        status = "PENDING"
+                    elif time_left > 0:
+                        status = f"Wait for {time_left:.2f}s"
+                    else:
+                        status = "READY"
+                    
+                    print(f"  [{ecu.name:6s}] ID=0x{ecu.arb_id:03X} | TEC={ecu.tec:3d} REC={ecu.rec:3d} | {ecu.state.name:13s} | {status}")
+                
+                print(f"{'='*100}\n")
+
+    # ---- Error reporting ----
+
+    # Process one transmitter bit-monitoring error according to its pre-error ACTIVE or PASSIVE state.
+    def report_bit_error(self, sender_slave_id: int, offender: str = "unknown"):
+        """Called by an ECU when it detects a bit-monitoring error.
+
+        IMPORTANT behavioural model (as requested):
+        - If the sender is ERROR_ACTIVE at the moment it detects the error, it emits an ACTIVE error flag (dominant 0),
+          which forces an error on the bus. Other transmitters may detect it later (e.g., due to bit-stuffing).
+        - If the sender is ERROR_PASSIVE at the moment it detects the error, it emits a PASSIVE error flag (recessive 1),
+          which does NOT disturb the bus when another transmitter keeps driving dominant bits. The frame may still complete OK.
+        """
+        # Ignore reports from unknown or already disconnected nodes.
+        sender = self.slaves.get(sender_slave_id)
+        if sender is None or sender.is_bus_off():
+            return
+
+        # If it already switched to an error-flag mode, ignore repeated notifications.
+        if getattr(sender, "_tx_mode", "NORMAL") != "NORMAL":
+            return
+        if getattr(sender, "_silence_bit_errors", False):
+            return
+
+        # Fault behavior is selected from the state observed before applying the +8 TEC penalty.
+        pre_state = sender.state
+
+        # -------------------------------
+        # ERROR PASSIVE: send recessive error flag, do NOT abort the frame
+        # -------------------------------
+        # A passive flag is recessive, so it cannot overwrite another transmitter dominant bit.
+        if pre_state is NodeState.ERROR_PASSIVE:
+            print(f"\n[MASTER] BIT ERROR (PASSIVE) acquired by {sender.name} (offender={offender}) -> error flag recessive, frame continue")
+            sender.apply_error_update(tec_delta=8)
+            sender._enter_error_flag(active=False)
+            print(f"[MASTER] {sender.name}: TEC={sender.tec} (+8 per error PASSIVE) State={sender.state.name}")
+            return
+
+        # -------------------------------
+        # ERROR ACTIVE: send dominant error flag, frame becomes an error-frame
+        # -------------------------------
+        # An active flag drives dominant and therefore invalidates the frame for every participant.
+        print(f"\n[MASTER] BIT ERROR (ACTIVE) acquired by {sender.name} (offender={offender}) -> error flag dominant, frame abort")
+        if self._sockcan is not None and not getattr(self, "_err_active_sent", False):
+            sockcan_send_data(self._sockcan, 0x7FF, b"\x00" * 6)
+            self._err_active_sent = True
+        self._frame_ok = False
+        self._active_error_frame = True
+
+        # Penalize the detecting transmitter and switch it from frame data to active error-flag output.
+        sender.apply_error_update(tec_delta=8)
+        sender._enter_error_flag(active=True)
+        print(f"[MASTER] {sender.name}: TEC={sender.tec} (+8 per error ACTIVE) State={sender.state.name}")
+
+        # Listening nodes increment REC once, while active transmitters are excluded from that receiver penalty.
+        # REC +1 for listeners (only once per error-frame)
+        if not self._rec_bumped_for_error:
+            active_set = set(self._active_senders or [])
+            for sid, ecu in self.slaves.items():
+                if ecu.is_bus_off():
+                    continue
+                if sid in active_set:
+                    continue
+                ecu.rec = max(0, ecu.rec + 1)
+            self._rec_bumped_for_error = True
+    # Dispatch exactly one state-specific handler per simulation tick.
+    def _loop(self):
+        while not self._stop:
+            self.clock += 1
+            if self.state == MasterState.IDLE:
+                self._handle_idle()
+            elif self.state == MasterState.ARBITRATION:
+                self._handle_arbitration_step()
+            elif self.state == MasterState.TRANSMIT:
+                self._handle_transmit_step()
+            elif self.state == MasterState.ERROR_FLAG:
+                self._handle_error_flag_step()
+            elif self.state == MasterState.ERROR_DELIM:
+                self._handle_error_delim_step()
+            elif self.state == MasterState.EOF:
+                self._handle_eof()
+            elif self.state == MasterState.INTERFRAME:
+                self._handle_interframe()
+
+            time.sleep(self.tick)
+
+    # Drain all currently queued requests and prepare their corresponding ECU bitstreams.
+    def _drain_start_intents(self) -> List[int]:
+        """Collect ALL pending start intents."""
+        new_contenders: List[int] = []
+        while True:
+            # Non-blocking queue access lets the loop stop immediately when no further intents are available.
+            try:
+                req = self._pending_starts.get_nowait()
+            except queue.Empty:
+                break
+            ecu = self.slaves.get(req.slave_id)
+            if ecu is None or ecu.is_bus_off():
+                continue
+            ecu._pending_req = req
+            ecu._bitstream = None
+            ecu._cursor = 0
+            ecu.begin_frame_if_needed()
+            if ecu.has_pending_frame() and req.slave_id not in new_contenders:
+                new_contenders.append(req.slave_id)
+        return new_contenders
+
+    # Fan one resolved bus bit out to every registered ECU receive queue.
+    def _broadcast(self, bus_bit: BitValue, sender_name: str, field: Field):
+        bt = BitTransmission(bus_bit, time.time(), sender_name, field)
+        for q in self.bit_queues.values():
+            try:
+                q.put_nowait(bt)
+            except Exception:
+                pass
+
+    # Collect pending ECUs, wait for the gather deadline, and then initialize a fresh arbitration round.
+    def _handle_idle(self):
+        # 1) Always drain new start intents (ECU that just asked to transmit).
+        #    NOTE: we must NOT rely only on this queue, because requests can arrive
+        #    while the bus is busy (TRANSMIT/ARBITRATION). In that case the ECU is
+        #    already in PENDING, but its intent might have been drained earlier.
+        self._drain_start_intents()
+
+        # Use one consistent timestamp for all gather-window decisions in this state-machine iteration.
+        now = time.time()
+
+        # 2) Contenders are ALL ECU that currently have a pending frame.
+        pending_ids = [
+            sid
+            for sid, ecu in self.slaves.items()
+            if (not ecu.is_bus_off()) and ecu.has_pending_frame()
+        ]
+
+        # 3) If no one is pending, nothing to do.
+        if not pending_ids and not self._collecting:
+            return
+
+        # 4) Start or continue the gather window.
+        if not self._collecting:
+            self._collecting = True
+            self._collect_deadline = now + self.gather_window_s
+            self._collect_contenders = set(pending_ids)
+
+            names = ", ".join(self.slaves[s].name for s in self._collect_contenders)
+            print(
+                f"[MASTER] IDLE: gather window ({self.gather_window_s:.2f}s) | Pending now: {names if names else '-'}"
+            )
+            return
+
+        # Collect new contenders that became pending during the window.
+        self._collect_contenders |= set(pending_ids)
+
+        # If (for any reason) nobody is pending anymore, stop collecting.
+        if not self._collect_contenders:
+            self._collecting = False
+            return
+
+        # Wait until the gather window expires.
+        if now < self._collect_deadline:
+            return
+
+        # 5) Window expired -> start arbitration with everything collected.
+        contenders = list(self._collect_contenders)
+        self._collecting = False
+        self._collect_contenders = set()
+
+        # Preserve insertion order while removing any duplicate contender identifiers.
+        self._contenders = list(dict.fromkeys(contenders))
+        self._winner = None
+        self._active_senders = []
+        self._frame_ok = True
+        self._error_senders = []
+        self._fault.on_new_frame()
+
+        # Prepare all ECU for arbitration (bitstream ready).
+        for sid in self._contenders:
+            self.slaves[sid].begin_frame_if_needed()
+            self.slaves[sid].reset_for_retransmission()
+
+        names = ", ".join(self.slaves[s].name for s in self._contenders)
+        print()
+        print(f"[MASTER] IDLE->ARBITRATION | Contenders: {names}")
+        self.state = MasterState.ARBITRATION
+
+    # Obtain the next arbitration contribution from one ECU without mutating its cursor.
+    def _get_arbitration_bit(self, ecu: BaseECU) -> Optional[Tuple[BitValue, Field]]:
+        nxt = ecu.peek_next_bit()
+        if nxt is None:
+            return None
+        bit, field = nxt
+        return bit, field
+
+    # Resolve wired-AND arbitration one bit at a time and remove nodes that lose on ID or RTR.
+    def _handle_arbitration_step(self):
+        self._arbitration_window = True
+
+        # Gather one offered bit from every contender still eligible for this arbitration tick.
+        offered: List[Tuple[int, BitValue, Field]] = []
+        for sid in list(self._contenders):
+            ecu = self.slaves[sid]
+            if ecu.is_bus_off() or not ecu.has_pending_frame():
+                self._contenders.remove(sid)
+                continue
+            nxt = self._get_arbitration_bit(ecu)
+            if nxt is None:
+                self._contenders.remove(sid)
+                continue
+            b, f = nxt
+            offered.append((sid, b, f))
+
+        if not offered:
+            self.state = MasterState.IDLE
+            return
+
+        # CAN bus resolution is dominant when at least one contender transmits a dominant bit.
+        bus_bit = BitValue.DOMINANT if any(b is BitValue.DOMINANT for _, b, _ in offered) else BitValue.RECESSIVE
+        self._current_field = offered[0][2]
+        bus_bit = self._fault.override_bus_bit(self._current_field, bus_bit)
+
+        # Print each arbitration bit together with the value offered by every contender.
+        contenders_str = " | ".join([f"{self.slaves[sid].name}={int(b)}" for sid, b, _ in offered])
+        print(f"  [ARB] {self._current_field.name:12s} | {contenders_str} -> BUS={int(bus_bit)}")
+
+        self._broadcast(bus_bit, sender_name="BUS", field=self._current_field)
+
+        # A node loses arbitration only by sending recessive while observing dominant in ID or RTR.
+        if self._current_field in {Field.ID, Field.RTR}:
+            losers: List[int] = []
+            for sid, b, _f in offered:
+                if b is BitValue.RECESSIVE and bus_bit is BitValue.DOMINANT:
+                    losers.append(sid)
+            for sid in losers:
+                ecu = self.slaves[sid]
+                print(f"  [ARB] {ecu.name} loses arbitraation")
+                ecu.reset_for_retransmission()
+                self._contenders.remove(sid)
+
+        for sid, _b, _f in offered:
+            if sid in self._contenders:
+                self.slaves[sid].advance()
+
+        # A single remaining contender becomes the frame winner and enters normal transmission.
+        if len(self._contenders) == 1:
+            self._winner = self._contenders[0]
+            self._active_senders = [self._winner]
+            win_ecu = self.slaves[self._winner]
+            win_ecu.mark_as_transmitting(True)
+            print(f"[MASTER] WINNER: {win_ecu.name} (ID=0x{win_ecu.arb_id:03X}) -> TRANSMIT")
+            # Reset per-frame error bookkeeping
+            self._frame_ok = True
+            self._active_error_frame = False
+            self._error_flag_ticks = 0
+            self._rec_bumped_for_error = False
+            self._error_senders = []
+            self.state = MasterState.TRANSMIT
+            return
+
+        # Multiple nodes surviving through RTR have identical arbitration fields and transmit simultaneously.
+        if self._current_field == Field.RTR and len(self._contenders) > 1:
+            self._active_senders = list(self._contenders)
+            self._winner = self._active_senders[0]
+            for sid in self._active_senders:
+                self.slaves[sid].mark_as_transmitting(True)
+            names = ",".join(self.slaves[s].name for s in self._active_senders)
+            print(f"[MASTER] COLLISION! Same ID/RTR: {names} -> TRANSMIT (error imminent)")
+            # Reset per-frame error bookkeeping
+            self._frame_ok = True
+            self._active_error_frame = False
+            self._error_flag_ticks = 0
+            self._rec_bumped_for_error = False
+            self._error_senders = []
+            self.state = MasterState.TRANSMIT
+
+    # Resolve active sender bits, perform bit monitoring, and advance or terminate the current frame.
+    def _handle_transmit_step(self):
+        assert self._winner is not None
+
+        # Requests arriving while the bus is busy are retained for a later idle/gather phase.
+        _ = self._drain_start_intents()
+
+        if not self._active_senders:
+            self._active_senders = [self._winner]
+
+        # Error-flag emitters and normal transmitters contribute through the same next-bit interface.
+        offered: List[Tuple[int, BitValue, Field]] = []
+        for sid in list(self._active_senders):
+            ecu = self.slaves[sid]
+            nxt = ecu.peek_next_bit()
+            if nxt is None:
+                continue
+            b, f = nxt
+            offered.append((sid, b, f))
+
+        # No offered bits means all active senders have completed or abandoned their frame contribution.
+        if not offered:
+            for sid in self._active_senders:
+                self.slaves[sid].mark_as_transmitting(False)
+            self.state = MasterState.EOF
+            return
+
+        # Divergent sender field labels indicate streams have desynchronized, so label the bus bit as STUFF.
+        field = offered[0][2]
+        if any(f != field for _sid, _b, f in offered):
+            field = Field.STUFF
+        self._current_field = field
+        self._arbitration_window = field in {Field.SOF, Field.ID, Field.RTR}
+
+        bus_bit = BitValue.DOMINANT if any(b is BitValue.DOMINANT for _sid, b, _f in offered) else BitValue.RECESSIVE
+        bus_bit = self._fault.override_bus_bit(field, bus_bit)
+
+        # Print each transmitted bit and, during a collision, each active sender contribution.
+        if len(self._active_senders) > 1:
+            senders_str = " | ".join([f"{self.slaves[sid].name}={int(b)}" for sid, b, _ in offered])
+            print(f"  [TX]  {self._current_field.name:12s} | {senders_str} -> BUS={int(bus_bit)}")
+        else:
+            print(f"  [TX]  {self._current_field.name:12s} | {self.slaves[self._winner].name}={int(bus_bit)}")
+
+        self._broadcast(bus_bit, sender_name="BUS", field=field)
+
+        # Let each active transmitter compare its intended bit against the resolved bus value.
+        for sid, _b, _f in offered:
+            self.slaves[sid].on_bus_bit(bus_bit, field, arbitration_window=self._arbitration_window)
+
+        if self.state == MasterState.TRANSMIT:
+            for sid, _b, _f in offered:
+                self.slaves[sid].advance()
+        # If an ACTIVE error flag is being emitted, count its bits and terminate the frame after 6 bits.
+        has_active_err_flag = any(self.slaves[sid].is_emitting_error_flag_active() for sid, _b, _f in offered)
+        if has_active_err_flag:
+            self._error_flag_ticks += 1
+            if self._error_flag_ticks >= 6:
+                # Mark as error-frame so the existing EOF error handling is used.
+                self._error_senders = list(set(self._active_senders or []))
+                for sid in (self._active_senders or []):
+                    self.slaves[sid].mark_as_transmitting(False)
+                self.state = MasterState.EOF
+
+
+    # Emit the legacy global error-flag sequence for senders stored in _error_senders.
+    def _handle_error_flag_step(self):
+        """Handle an ACTIVE (6 dominant bits) or PASSIVE (8 recessive bits) error flag."""
+        if not self._error_senders:
+            self.state = MasterState.ERROR_DELIM
+            return
+
+        # Classify the error senders according to their current fault-confinement state.
+        active_senders = [
+            sid for sid in self._error_senders
+            if sid in self.slaves and self.slaves[sid].state is NodeState.ERROR_ACTIVE
+        ]
+        passive_senders = [
+            sid for sid in self._error_senders
+            if sid in self.slaves and self.slaves[sid].state is NodeState.ERROR_PASSIVE
+        ]
+
+        if active_senders:
+            # ACTIVE ERROR FLAG: six DOMINANT bits.
+            flag_bit = BitValue.DOMINANT
+            flag_type = "ACTIVE"
+            senders_str = ", ".join([self.slaves[sid].name for sid in active_senders])
+        else:
+            # PASSIVE ERROR FLAG: eight RECESSIVE bits.
+            flag_bit = BitValue.RECESSIVE
+            flag_type = "PASSIVE"
+            senders_str = ", ".join([self.slaves[sid].name for sid in passive_senders])
+
+        print(
+            f"  [ERR] ERROR_FLAG_{flag_type} | {senders_str} -> BUS={int(flag_bit)} "
+            f"(bit {7-self._error_flag_bits_left}/{'6' if flag_type=='ACTIVE' else '8'})"
+        )
+
+        # Consume one error-flag bit from the remaining-bit counter.
+        self._error_flag_bits_left -= 1
+
+        if self._error_flag_bits_left <= 0:
+            # A completed passive error flag is treated as a successful transmission for TEC recovery.
+            for sid in passive_senders:
+                ecu = self.slaves[sid]
+                ecu.apply_success_update()
+                print(f"[MASTER] {ecu.name}: TEC={ecu.tec} (-1 per ERROR_FLAG_PASSIVE trasmited) State={ecu.state.name}")
+
+            self.state = MasterState.ERROR_DELIM
+
+    # Emit the recessive delimiter that separates an error flag from the next interframe period.
+    def _handle_error_delim_step(self):
+        """Handle the ERROR DELIMITER, represented by eight RECESSIVE bits."""
+        if self._error_delim_bits_left <= 0:
+            self.state = MasterState.INTERFRAME
+            return
+        
+        delim_bit = BitValue.RECESSIVE
+        print(f"  [ERR] ERROR_DELIM | BUS={int(delim_bit)} (bit {9-self._error_delim_bits_left}/8)")
+        self._broadcast(delim_bit, sender_name="ERROR_DELIM", field=Field.STUFF)
+        
+        self._error_delim_bits_left -= 1
+        
+        if self._error_delim_bits_left <= 0:
+            self.state = MasterState.INTERFRAME
+
+    # Finalize the frame by forwarding successful data, updating counters, or preparing retransmission.
+    def _handle_eof(self):
+        # Only a valid frame with a known winner can be delivered and counted as successful.
+        if self._frame_ok and self._winner is not None:
+            sender0 = self.slaves[self._winner]
+            req0 = sender0._pending_req
+            if req0 is not None:
+                print(f"[MASTER] Frame OK: ID=0x{req0.arbitration_id:03X} data={req0.data.hex().upper()}")
+                if self._sockcan is not None:
+                    sockcan_send_data(self._sockcan, req0.arbitration_id, req0.data)
+                
+                # Successful-transmission correction: decrement TEC by one for every active sender.
+                for sid in (self._active_senders or [self._winner]):
+                    ecu = self.slaves[sid]
+                    ecu.apply_success_update()
+                    print(f"[MASTER] {ecu.name}: TEC={ecu.tec} (-1 per success) State={ecu.state.name}")
+                    ecu._pending_req = None
+                    ecu._cursor = 0
+                    ecu._bitstream = None
+                # Successful reception correction: listening nodes decrement REC by one when possible.
+                for sid, ecu in self.slaves.items():
+                    if sid in self._active_senders or ecu.is_bus_off():
+                        continue
+                    if ecu.rec > 0:
+                        ecu.rec -= 1
+                        print(f"[MASTER] {ecu.name}: REC={ecu.rec} (-1 per frame OK received)")
+                
+        else:
+            # Error frames keep their request semantics so the winner can be rewound for a later attempt.
+            if self._error_senders or self._active_error_frame:
+                print(f"[MASTER] Frame ERROR -> Retransmission")
+
+            if self._winner is not None:
+                self.slaves[self._winner].reset_for_retransmission()
+
+        self.state = MasterState.INTERFRAME
+
+    # Clear all per-frame state and return the master to IDLE for the next gather window.
+    def _handle_interframe(self):
+        self._err_active_sent = False
+        self._contenders = []
+        self._active_senders = []
+        self._winner = None
+        self._error_senders = []
+        self._frame_ok = True
+        self._active_error_frame = False
+        self._error_flag_ticks = 0
+        self._rec_bumped_for_error = False
+        # reset per-frame passive error bookkeeping
+        self._passive_error_senders.clear()
+        for ecu in self.slaves.values():
+            ecu._silence_bit_errors = False
+            ecu._tx_mode = "NORMAL"
+            ecu._err_flag_bits_left = 0
+        self.state = MasterState.IDLE
+
+
+# Configure the demonstration topology, start every worker, and run until BUS_OFF or manual interruption.
+def main():
+    print("=" * 100)
+    print("CAN BUS SIMULATOR - DYNAMIC ARBITRATION TEST")
+    print("=" * 100)
+    print("\nConfiguration:")
+    print("  - ECUs with LOWER IDs (HIGH priority) -> LONGER period (transmit LESS frequently)")
+    print("  - ECUs with HIGHER IDs (LOW priority) -> SHORTER period (transmit MORE frequently)")
+    print("  - 2 ECUs with the SAME ID -> generate a COLLISION and increment TEC\n")
+
+    print("\nTested scenarios:")
+    print("  1. A single ECU transmitting by itself")
+    print("  2. Arbitration between ECUs with different IDs")
+    print("  3. Collision between ECUs with the same ID")
+    print("  4. An ECU requesting transmission while another ECU is transmitting\n")
+
+    print("\nIMPLEMENTED FIXES:")
+    print("  - START_SLOT removed: all PENDING ECUs participate in arbitration IMMEDIATELY")
+    print("  - Collision: BOTH ECUs increment their TEC by +8")
+    print("  - ACTIVE ERROR FLAG: 6 DOMINANT bits (TEC < 128)")
+    print("  - PASSIVE ERROR FLAG: 8 RECESSIVE bits (TEC >= 128)")
+    print("  - TEC -= 1 after a successful transmission")
+    print("  - PASSIVE ERROR FLAG: +8 for the error, -1 for success = net increase of +7\n")
+
+    # Create the master with a fine-grained simulation tick and optional SocketCAN forwarding disabled.
+    master = CANMaster(
+        tick_ms=0.5,
+        forward_to_socketcan=False,
+        can_channel="vcan0",
+        fault_injector=None,
+    )
+    master.start()
+
+    # ========================================
+    # ECU CONFIGURATION - OPTIMIZED TIMING
+    # ========================================
+    # The following start times are selected to create deliberate overlaps:
+    # T=0 s: ECU_A starts alone, exercising the single-transmitter scenario.
+    # T=2 s: ECU_B and ECU_C start together, exercising arbitration between different IDs.
+    # T=4 s: ECU_D and ECU_E start together, exercising a same-ID collision.
+    # T=6 s: ECU_A transmits again while other ECUs may also be active.
+    
+    # ECU_A: low ID (0x050), high priority, six-second period, starts almost immediately.
+    ecu_a = BaseECU("ECU_A", 1, 0x050, master, tx_period=6.0, start_delay=0.1, auto_tx=True)
+    
+    # ECU_B: medium-low ID (0x100), medium-high priority, eight-second period, starts at T=2 s.
+    ecu_b = BaseECU("ECU_B", 2, 0x100, master, tx_period=8.0, start_delay=2.0, auto_tx=True)
+    
+    # ECU_C: medium-high ID (0x200), medium-low priority, ten-second period, starts with ECU_B.
+    ecu_c = BaseECU("ECU_C", 3, 0x200, master, tx_period=10.0, start_delay=2.0, auto_tx=True)
+    
+    # ECU_D: high ID (0x300), low priority, fourteen-second period, starts at T=4 s.
+    ecu_d = BaseECU("ECU_D", 4, 0x300, master, tx_period=14.0, start_delay=4.0, auto_tx=True)
+    
+    # ECU_E: same ID as ECU_D, intentionally causing a collision; starts at T=4 s.
+    ecu_e = BaseECU("ECU_E", 5, 0x300, master, tx_period=14.0, start_delay=4.0, auto_tx=True)
+
+    # Print the configured identifiers and periods before any ECU worker begins producing traffic.
+    print("Configured ECUs:")
+    print(f"  - ECU_A: ID=0x050 (HIGH priority)        -> TX every 6.0s  (start: 0.1s)")
+    print(f"  - ECU_B: ID=0x100 (MEDIUM-HIGH priority) -> TX every 8.0s  (start: 2.0s)")
+    print(f"  - ECU_C: ID=0x200 (MEDIUM-LOW priority)  -> TX every 10.0s (start: 2.0s)")
+    print(f"  - ECU_D: ID=0x300 (LOW priority)         -> TX every 12.0s (start: 4.0s)")
+    print(f"  - ECU_E: ID=0x300 (COLLISION with D!)    -> TX every 14.0s (start: 4.0s)")
+    print("\n" + "=" * 100)
+
+    # Start ECUs after the master so submitted requests always have an active consumer.
+    ecu_a.start()
+    ecu_b.start()
+    ecu_c.start()
+    ecu_d.start()
+    ecu_e.start()
+
+    print("\nSimulation started! (Press Ctrl+C to stop)\n")
+
+    # Keep the main thread alive while daemon workers execute the simulation.
+    try:
+        while True:
+            time.sleep(1.0)
+            
+            # Stop the demonstration once any ECU reaches the BUS_OFF state.
+            if any(ecu.is_bus_off() for ecu in [ecu_a, ecu_b, ecu_c, ecu_d, ecu_e]):
+                print(f"\n{'*'*100}")
+                print(f"BUS-OFF DETECTED!")
+                print(f"{'*'*100}")
+                print(f"  ECU_A: TEC={ecu_a.tec:3d} REC={ecu_a.rec:3d} State={ecu_a.state.name}")
+                print(f"  ECU_B: TEC={ecu_b.tec:3d} REC={ecu_b.rec:3d} State={ecu_b.state.name}")
+                print(f"  ECU_C: TEC={ecu_c.tec:3d} REC={ecu_c.rec:3d} State={ecu_c.state.name}")
+                print(f"  ECU_D: TEC={ecu_d.tec:3d} REC={ecu_d.rec:3d} State={ecu_d.state.name}")
+                print(f"  ECU_E: TEC={ecu_e.tec:3d} REC={ecu_e.rec:3d} State={ecu_e.state.name}")
+                print(f"{'*'*100}")
+                break
+            
+    except KeyboardInterrupt:
+        print("\n\nManual interruption simulation")
+
+    # Stop all worker threads and print the final fault-confinement counters.
+    print(f"\n{'='*100}")
+    print("[FINAL STATUS]")
+    print(f"{'='*100}")
+    print(f"  ECU_A: TEC={ecu_a.tec:3d} REC={ecu_a.rec:3d} State={ecu_a.state.name}")
+    print(f"  ECU_B: TEC={ecu_b.tec:3d} REC={ecu_b.rec:3d} State={ecu_b.state.name}")
+    print(f"  ECU_C: TEC={ecu_c.tec:3d} REC={ecu_c.rec:3d} State={ecu_c.state.name}")
+    print(f"  ECU_D: TEC={ecu_d.tec:3d} REC={ecu_d.rec:3d} State={ecu_d.state.name}")
+    print(f"  ECU_E: TEC={ecu_e.tec:3d} REC={ecu_e.rec:3d} State={ecu_e.state.name}")
+    print(f"{'='*100}\n")
+
+    ecu_a.stop()
+    ecu_b.stop()
+    ecu_c.stop()
+    ecu_d.stop()
+    ecu_e.stop()
+    master.stop()
+
+
+# Execute the interactive simulation only when this file is launched as a script.
+if __name__ == "__main__":
+    main()
